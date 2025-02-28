@@ -1,5 +1,0 @@
-ultralytics
-dill
-onnx
-onnxruntime
-onnxslime

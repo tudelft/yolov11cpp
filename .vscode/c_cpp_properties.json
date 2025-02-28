@@ -4,9 +4,10 @@
             "name": "Mac",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/opt/homebrew/Cellar/opencv/4.10.0_11/include/opencv4/opencv2",
-                "/opt/homebrew/Cellar/opencv/4.10.0_11/include/opencv4",
-                "/opt/homebrew/Cellar/onnxruntime/1.17.1/include/onnxruntime"
+                "/opt/homebrew/Cellar/opencv/4.11.0/include/opencv4/opencv2",
+                "/opt/homebrew/Cellar/opencv/4.11.0/include/opencv4",
+                "/opt/homebrew/Cellar/onnxruntime/1.17.1/include/onnxruntime",
+                "/Users/danielsarmiento/Desktop/hobby/yolov11cpp/src/ia/"
             ],
             "defines": [],
             "macFrameworkPath": [],
@@ -16,8 +17,9 @@
             "intelliSenseMode": "clang-x64",
             "browse": {
                 "path": [
-                    "/opt/homebrew/Cellar/opencv/4.10.0_11/include/opencv4",
-                    "/opt/homebrew/Cellar/onnxruntime/1.17.1/include/onnxruntime"
+                    "/opt/homebrew/Cellar/opencv/4.11.0/include/opencv4",
+                    "/opt/homebrew/Cellar/onnxruntime/1.17.1/include/onnxruntime",
+                    "/Users/danielsarmiento/Desktop/hobby/yolov11cpp/src/ia/"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
                 "databaseFilename": ""
