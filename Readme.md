@@ -103,6 +103,12 @@ Enable debugging by uncommenting these lines in `src/ia/tools/Config.hpp`:
 #define TIMING_MODE
 ```
 
+<p align="center">
+  <video src="./src/runs/detect/predict/t1.mp4"  type="video/mp4" style="margin-right: 10px;"/>
+  <video src="./src/result.mp4" type="video/mp4" />
+</p>
+
+
 ## Troubleshooting
 
 ### Accuracy Issues
