@@ -265,7 +265,8 @@ class YOLO11Detector(
     }
 
     /**
-     * Post-processes the model outputs to extract detections in the exact same way as C++
+     * Post-processes the model outputs to extract detections
+     * Fixed to properly handle YOLOv11 output tensor format [1,88,8400]
      */
     private fun postprocess(
         outputMap: Map<Int, Any>,
@@ -283,18 +284,16 @@ class YOLO11Detector(
             val outputBuffer = outputMap[0] as ByteBuffer
             outputBuffer.rewind()
 
-            // Get output dimensions - match the C++ version's expectations
+            // Get output dimensions
             val outputShapes = interpreter.getOutputTensor(0).shape()
             debug("Output tensor shape: ${outputShapes.joinToString()}")
 
-            // Using correct indexing based on tensor shape: [batch, features, detections]
-            val num_features = outputShapes[1]  // Total features = 4 box coords + num classes
-            val num_detections = outputShapes[2] // Number of detection boxes
+            // YOLOv11 output tensor shape is [1, 84+4, 8400] = [batch, classes+xywh, predictions]
+            // This is in TRANSPOSE format (different from YOLOv8)
+            val num_classes = outputShapes[1] - 4  // 84 classes (88 - 4)
+            val num_predictions = outputShapes[2]   // 8400 predictions
 
-            // Calculate number of classes (features minus 4 coordinates)
-            numClasses = num_features - 4
-
-            debug("Processing output tensor: features=$num_features, detections=$num_detections, classes=$numClasses")
+            debug("Processing output tensor: features=${outputShapes[1]}, predictions=$num_predictions, classes=$num_classes")
 
             // Extract boxes, confidences, and class ids
             val boxes = mutableListOf<RectF>()
@@ -303,44 +302,45 @@ class YOLO11Detector(
             val nmsBoxes = mutableListOf<RectF>() // For class-separated NMS
 
             // Create a float array from the buffer for more efficient access
-            val outputArray = FloatArray(outputShapes[0] * num_features * num_detections)
+            val outputArray = FloatArray(outputShapes[0] * outputShapes[1] * outputShapes[2])
             outputBuffer.rewind()
             for (i in outputArray.indices) {
                 outputArray[i] = outputBuffer.float
             }
 
-            // Process each detection with corrected access pattern
-            for (d in 0 until num_detections) {
-                // Read coordinates - fix the access pattern to match C++ implementation
-                // The data is arranged as [x1,x2,...,xn, y1,y2,...,yn, w1,w2,...,wn, h1,h2,...,hn, scores...]
-                val centerX = outputArray[0 * num_detections + d]
-                val centerY = outputArray[1 * num_detections + d]
-                val width = outputArray[2 * num_detections + d]
-                val height = outputArray[3 * num_detections + d]
-
-                // Find class with maximum score
+            // Process each prediction
+            for (i in 0 until num_predictions) {
+                // Find class with maximum score and its index
                 var maxScore = -Float.MAX_VALUE
                 var classId = -1
-
-                // Read class scores with corrected access pattern
-                for (c in 0 until numClasses) {
-                    val score = outputArray[(4 + c) * num_detections + d]
+                
+                // Scan through all classes (start at index 4, after x,y,w,h)
+                for (c in 0 until num_classes) {
+                    // Class scores are after the 4 box coordinates
+                    val score = outputArray[(4 + c) * num_predictions + i]
                     if (score > maxScore) {
                         maxScore = score
                         classId = c
                     }
                 }
 
-                // Keep detections above threshold
-                if (maxScore > confThreshold) {
-                    // Convert center coordinates to top-left format
-                    val left = centerX - width / 2.0f
-                    val top = centerY - height / 2.0f
-                    val right = centerX + width / 2.0f
-                    val bottom = centerY + height / 2.0f
+                // Filter by confidence threshold
+                if (maxScore >= confThreshold) {
+                    // Extract bounding box coordinates (stored in first 4 channels)
+                    // The data is arranged as [x1,x2,...,xn, y1,y2,...,yn, w1,w2,...,wn, h1,h2,...,hn, scores...]
+                    val x = outputArray[0 * num_predictions + i]  // center_x
+                    val y = outputArray[1 * num_predictions + i]  // center_y
+                    val w = outputArray[2 * num_predictions + i]  // width
+                    val h = outputArray[3 * num_predictions + i]  // height
 
-                    // Log coordinates for debugging
-                    debug("Detection $d: center=($centerX,$centerY), wh=($width,$height), score=$maxScore, class=$classId")
+                    // Convert from center format (xywh) to corner format (xyxy)
+                    val left = x - w / 2
+                    val top = y - h / 2
+                    val right = x + w / 2
+                    val bottom = y + h / 2
+
+                    debug("Detection found: center=($x,$y), wh=($w,$h), score=$maxScore, class=$classId")
+                    debug("            box: ($left,$top,$right,$bottom)")
 
                     // Scale coordinates to original image size
                     val scaledBox = scaleCoords(
@@ -349,12 +349,12 @@ class YOLO11Detector(
                         originalImageSize
                     )
 
-                    // Validate the box has positive dimensions before adding
+                    // Validate dimensions before adding
                     val boxWidth = scaledBox.right - scaledBox.left
                     val boxHeight = scaledBox.bottom - scaledBox.top
                     
-                    if (boxWidth > 1 && boxHeight > 1) {  // Require at least 1x1 pixel
-                        // Round coordinates to integer precision (match C++ implementation)
+                    if (boxWidth > 1 && boxHeight > 1) {  // Ensure reasonable size
+                        // Round coordinates to integer precision
                         val roundedBox = RectF(
                             round(scaledBox.left),
                             round(scaledBox.top),
@@ -362,7 +362,7 @@ class YOLO11Detector(
                             round(scaledBox.bottom)
                         )
 
-                        // Create offset box for NMS with class separation (exactly like C++)
+                        // Create offset box for NMS with class separation
                         val nmsBox = RectF(
                             roundedBox.left + classId * 7680f,
                             roundedBox.top + classId * 7680f,
@@ -392,25 +392,11 @@ class YOLO11Detector(
             for (idx in selectedIndices) {
                 val box = boxes[idx]
 
-                // Fix: Calculate width and height correctly from left, top, right, bottom
+                // Calculate width and height from corners
                 val width = box.right - box.left
                 val height = box.bottom - box.top
 
-                // Skip invalid boxes
-                if (width <= 0 || height <= 0) {
-                    debug("Skipped invalid box with dimensions: ${width}x${height}")
-                    continue
-                }
-
-                // Verify class ID is valid
-                val validClassId = if (classIds[idx] >= 0 && classIds[idx] < classNames.size) {
-                    classIds[idx]
-                } else {
-                    debug("Invalid class ID: ${classIds[idx]}. Using fallback.")
-                    0 // Fallback to first class
-                }
-
-                // Create detection with correct coordinates
+                // Create detection object with proper dimensions
                 val detection = Detection(
                     BoundingBox(
                         box.left.toInt(),
@@ -419,12 +405,12 @@ class YOLO11Detector(
                         height.toInt()
                     ),
                     confidences[idx],
-                    validClassId
+                    classIds[idx]
                 )
 
                 detections.add(detection)
                 debug("Added detection: box=${detection.box.x},${detection.box.y},${detection.box.width},${detection.box.height}, " +
-                      "conf=${detection.conf}, class=${validClassId}")
+                        "conf=${detection.conf}, class=${classIds[idx]}")
             }
         } catch (e: Exception) {
             debug("Error during postprocessing: ${e.message}")
@@ -776,7 +762,7 @@ class YOLO11Detector(
 
     /**
      * Scale coordinates from model input size to original image size
-     * Fixed to convert Double to Float for proper type handling
+     * Updated to handle letterboxing correctly for YOLOv11
      */
     private fun scaleCoords(
         imageShape: Size,
@@ -784,43 +770,41 @@ class YOLO11Detector(
         imageOriginalShape: Size,
         clip: Boolean = true
     ): RectF {
-        // Calculate gain - explicitly convert Double to Float
-        val gain = min(
-            imageShape.width / imageOriginalShape.width,
-            imageShape.height / imageOriginalShape.height
-        ).toFloat()
+        // Calculate the scaling factor and padding
+        val original_h = imageOriginalShape.height.toFloat()
+        val original_w = imageOriginalShape.width.toFloat()
+        val input_h = imageShape.height.toFloat()
+        val input_w = imageShape.width.toFloat()
         
-        // Calculate padding - explicitly convert Double to Float
-        val padX = ((imageShape.width - imageOriginalShape.width * gain) / 2.0).toFloat()
-        val padY = ((imageShape.height - imageOriginalShape.height * gain) / 2.0).toFloat()
+        // Calculate gain and padding
+        val gain = min(input_w / original_w, input_h / original_h)
         
-        // Debug inputs for verification
-        debug("Scaling: coords=${coords.left},${coords.top},${coords.right},${coords.bottom}")
-        debug("Scaling: shape=${imageShape.width}x${imageShape.height}, originalShape=${imageOriginalShape.width}x${imageOriginalShape.height}")
-        debug("Scaling: gain=$gain, pad=($padX,$padY)")
+        // Calculate padding in the letterboxed image
+        val pad_w = (input_w - original_w * gain) / 2.0f
+        val pad_h = (input_h - original_h * gain) / 2.0f
         
-        // Scale coordinates back to original image size
-        val scaledLeft = (coords.left - padX) / gain
-        val scaledTop = (coords.top - padY) / gain
-        val scaledRight = (coords.right - padX) / gain
-        val scaledBottom = (coords.bottom - padY) / gain
+        // Log details for debugging
+        debug("Scale coords: input=${input_w}x${input_h}, original=${original_w}x${original_h}")
+        debug("Scale coords: gain=$gain, padding=($pad_w, $pad_h)")
+        debug("Scale coords: input box=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
         
-        debug("Scaling: result=${scaledLeft},${scaledTop},${scaledRight},${scaledBottom}")
+        // Inverse transform: from normalized input coordinates to original image coordinates
+        val x1 = (coords.left - pad_w) / gain
+        val y1 = (coords.top - pad_h) / gain
+        val x2 = (coords.right - pad_w) / gain
+        val y2 = (coords.bottom - pad_h) / gain
         
-        // Create result rectangle with validation
-        val result = RectF(
-            scaledLeft,
-            scaledTop,
-            scaledRight,
-            scaledBottom
-        )
+        debug("Scale coords: output box=($x1, $y1, $x2, $y2)")
         
-        // Clip coordinates to image boundaries if requested
+        // Create result rectangle
+        val result = RectF(x1, y1, x2, y2)
+        
+        // Clip to image boundaries if requested
         if (clip) {
-            result.left = max(0f, min(result.left, imageOriginalShape.width.toFloat()))
-            result.top = max(0f, min(result.top, imageOriginalShape.height.toFloat()))
-            result.right = max(0f, min(result.right, imageOriginalShape.width.toFloat()))
-            result.bottom = max(0f, min(result.bottom, imageOriginalShape.height.toFloat()))
+            result.left = max(0f, min(result.left, original_w - 1))
+            result.top = max(0f, min(result.top, original_h - 1))
+            result.right = max(0f, min(result.right, original_w))
+            result.bottom = max(0f, min(result.bottom, original_h))
         }
         
         return result

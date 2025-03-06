@@ -96,7 +96,6 @@ class MainActivity : AppCompatActivity() {
             // Initialize the YOLO11 detector with model and labels from assets
             val modelPath = "best_float16.tflite"
             val labelsPath = "classes.txt"
-            val imagePath = "image_2.jpg" // Test image path
 
             Log.d(TAG, "Loading model from: $modelPath")
             Log.d(TAG, "Loading labels from: $labelsPath")
@@ -113,24 +112,22 @@ class MainActivity : AppCompatActivity() {
                 resultText.text = "Model loaded, preparing image..."
             }
 
-            // Load test image from assets with additional debug info
-            val imageBitmap = loadImageFromAssets(imagePath)
+            // Load test image from assets
+            val imageBitmap = loadImageFromAssets("image_2.jpg")
 
             if (imageBitmap != null) {
                 Log.d(TAG, "Image loaded with dimensions: ${imageBitmap.width}x${imageBitmap.height}")
-                
-                // Show original image while detection runs
+
                 runOnUiThread {
-                    imageView.setImageBitmap(imageBitmap)
                     resultText.text = "Running detection..."
                 }
 
                 try {
                     val startTime = SystemClock.elapsedRealtime()
 
-                    // Try with a lower confidence threshold first to see if we detect anything
-                    val confThreshold = 0.15f  // Lower than default to catch more detections for debugging
-                    val iouThreshold = 0.45f   // Match C++ implementation
+                    // Use exactly the same thresholds as in C++
+                    val confThreshold = 0.25f
+                    val iouThreshold = 0.45f
 
                     Log.d(TAG, "Starting detection with conf=$confThreshold, iou=$iouThreshold")
 
@@ -158,24 +155,33 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
+                    // Log all detections
+                    detections.forEachIndexed { index, detection ->
+                        val className = yoloDetector.getClassName(detection.classId)
+                        Log.d(TAG, "Detection #$index: $className (${detection.conf}), " +
+                                "box=${detection.box.x},${detection.box.y},${detection.box.width},${detection.box.height}")
+                    }
+
+                    // Filter by confidence for display purposes
+                    val displayThreshold = 0.30f  // Higher threshold just for display
+                    val qualityDetections = detections.filter { it.conf > displayThreshold }
+                    Log.d(TAG, "After filtering with threshold $displayThreshold: ${qualityDetections.size} detections")
+
+                    // Draw detections with mask overlay for better visualization
+                    val resultBitmap = yoloDetector.drawDetectionsMask(imageBitmap, qualityDetections)
+
                     // Show results in UI
                     runOnUiThread {
-                        if (detections.isNotEmpty()) {
-                            // Draw detections with mask overlay for better visualization
-                            val resultBitmap = yoloDetector.drawDetectionsMask(imageBitmap, detections)
-                            imageView.setImageBitmap(resultBitmap)
-                        } else {
-                            // Show original image if no detections
-                            imageView.setImageBitmap(imageBitmap)
-                        }
+                        // Display the image with detections
+                        imageView.setImageBitmap(resultBitmap)
 
                         // Format and display detection results
                         val resultInfo = StringBuilder()
                         resultInfo.append("Detection completed in $inferenceTime ms\n")
-                        resultInfo.append("Found ${detections.size} objects\n\n")
+                        resultInfo.append("Found ${detections.size} objects (${qualityDetections.size} shown)\n\n")
 
                         // Display top detections with highest confidence
-                        detections.sortedByDescending { it.conf }
+                        qualityDetections.sortedByDescending { it.conf }
                             .take(5)
                             .forEach { detection ->
                                 val className = yoloDetector.getClassName(detection.classId)
@@ -190,19 +196,19 @@ class MainActivity : AppCompatActivity() {
                     // Show original image at least
                     val finalImageBitmap = imageBitmap
                     runOnUiThread {
-                        resultText.text = "Detection error: ${e.message}"
+                        resultText.text = "Detection error: ${e.message}\n${e.stackTraceToString().take(200)}..."
                         imageView.setImageBitmap(finalImageBitmap)
                     }
                 }
             } else {
                 runOnUiThread {
-                    resultText.text = "Error: Failed to load image. Please check image_2.jpg in assets folder."
+                    resultText.text = "Error: Failed to load image from assets. Please check that image_2.jpg exists in the assets folder."
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in detection process", e)
             runOnUiThread {
-                resultText.text = "Error: ${e.message}"
+                resultText.text = "Error: ${e.message}\n${e.stackTraceToString().take(200)}..."
             }
         }
     }
