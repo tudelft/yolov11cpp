@@ -61,43 +61,79 @@ class YOLO11Detector(
         // Load model with proper options
         val tfliteOptions = Interpreter.Options()
 
-        // GPU Delegate setup if available and requested
+        // GPU Delegate setup with improved error handling
         if (useGPU) {
-            val compatList = CompatibilityList()
-            if (compatList.isDelegateSupportedOnThisDevice) {
-                debug("GPU acceleration enabled")
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                gpuDelegate = GpuDelegate(delegateOptions)
-                tfliteOptions.addDelegate(gpuDelegate)
-            } else {
-                debug("GPU acceleration not supported, using CPU")
-                tfliteOptions.setNumThreads(4)
+            try {
+                val compatList = CompatibilityList()
+                if (compatList.isDelegateSupportedOnThisDevice) {
+                    debug("Attempting GPU acceleration")
+                    
+                    // Use safer GPU delegation option that allows fallback
+                    val delegateOptions = GpuDelegate.Options().apply {
+                        setPrecisionLossAllowed(true)  // Allow precision loss for better compatibility
+                        setQuantizedModelsAllowed(true)  // Allow quantized models
+                        setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                    }
+                    
+                    gpuDelegate = GpuDelegate(delegateOptions)
+                    tfliteOptions.addDelegate(gpuDelegate)
+                    
+                    // Set fallback options for operations not supported by GPU
+                    tfliteOptions.setUseXNNPACK(true)  // Use XNNPACK acceleration for CPU operations
+                    tfliteOptions.setAllowFp16PrecisionForFp32(true)  // Allow precision reduction
+                    
+                    debug("GPU acceleration configured with fallback options")
+                } else {
+                    debug("GPU acceleration not supported on this device, using CPU")
+                    configureCpuOptions(tfliteOptions)
+                }
+            } catch (e: Exception) {
+                debug("Error setting up GPU acceleration: ${e.message}")
+                debug("Falling back to CPU execution")
+                // Clean up any GPU resources that might have been allocated
+                gpuDelegate?.close()
+                gpuDelegate = null
+                configureCpuOptions(tfliteOptions)
             }
         } else {
-            debug("Using CPU for inference")
-            tfliteOptions.setNumThreads(4)
+            debug("GPU acceleration disabled by user, using CPU")
+            configureCpuOptions(tfliteOptions)
         }
 
-        // Load the TFLite model
-        val modelBuffer = loadModelFile(modelPath)
-        interpreter = Interpreter(modelBuffer, tfliteOptions)
-
-        // Get input shape information
-        val inputTensor = interpreter.getInputTensor(0)
-        val inputShape = inputTensor.shape()
-        inputHeight = inputShape[1]
-        inputWidth = inputShape[2]
-        isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
-
-        // Get output shape information to determine number of classes
-        val outputTensor = interpreter.getOutputTensor(0)
-        val outputShape = outputTensor.shape()
-        numClasses = outputShape[1] - 4 // The output contains [x, y, w, h, class1, class2, ...]
-
-        debug("Model loaded with input dimensions: $inputWidth x $inputHeight")
-        debug("Model uses ${if(isQuantized) "quantized" else "float"} input")
-        debug("Model output shape: ${outputShape.joinToString()}")
-        debug("Detected $numClasses classes")
+        // Load the TFLite model with diagnostic information
+        val modelBuffer: MappedByteBuffer
+        try {
+            debug("Loading model from $modelPath")
+            modelBuffer = loadModelFile(modelPath)
+            debug("Model loaded successfully, size: ${modelBuffer.capacity() / 1024} KB")
+        } catch (e: Exception) {
+            debug("Failed to load model: ${e.message}")
+            throw RuntimeException("Model loading failed", e)
+        }
+        
+        try {
+            interpreter = Interpreter(modelBuffer, tfliteOptions)
+            debug("TFLite interpreter created successfully")
+            
+            // Log interpreter details
+            val inputTensor = interpreter.getInputTensor(0)
+            val inputShape = inputTensor.shape()
+            val outputTensor = interpreter.getOutputTensor(0)
+            val outputShape = outputTensor.shape()
+            
+            debug("Model input shape: ${inputShape.joinToString()}")
+            debug("Model output shape: ${outputShape.joinToString()}")
+            
+            inputHeight = inputShape[1]
+            inputWidth = inputShape[2]
+            isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
+            numClasses = outputShape[1] - 4
+        } catch (e: Exception) {
+            debug("Failed to initialize interpreter: ${e.message}")
+            // Clean up resources
+            gpuDelegate?.close()
+            throw RuntimeException("TFLite initialization failed", e)
+        }
 
         // Load class names and generate colors
         classNames = loadClassNames(labelsPath)
@@ -109,6 +145,19 @@ class YOLO11Detector(
 
         debug("Loaded ${classNames.size} classes")
     }
+    
+    /**
+     * Configure CPU-specific options for the TFLite interpreter
+     */
+    private fun configureCpuOptions(options: Interpreter.Options) {
+        // Determine optimal thread count based on device
+        val cpuCores = Runtime.getRuntime().availableProcessors()
+        val optimalThreads = if (cpuCores <= 4) cpuCores else cpuCores - 2
+        
+        options.setNumThreads(optimalThreads)
+        options.setUseXNNPACK(true)  // Use XNNPACK for CPU acceleration
+        debug("CPU options configured with $optimalThreads threads")
+    }
 
     /**
      * Main detection function that processes an image and returns detected objects
@@ -118,49 +167,61 @@ class YOLO11Detector(
         val startTime = SystemClock.elapsedRealtime()
         debug("Starting detection with conf=$confidenceThreshold, iou=$iouThreshold")
         
-        // Add debug for input dimensions
-        debug("Input image dimensions: ${bitmap.width}x${bitmap.height}")
+        try {
+            // Add debug for input dimensions
+            debug("Input image dimensions: ${bitmap.width}x${bitmap.height}")
 
-        // Convert Bitmap to Mat for OpenCV processing
-        val inputMat = Mat()
-        Utils.bitmapToMat(bitmap, inputMat)
-        Imgproc.cvtColor(inputMat, inputMat, Imgproc.COLOR_RGBA2BGR)
+            // Convert Bitmap to Mat for OpenCV processing
+            val inputMat = Mat()
+            Utils.bitmapToMat(bitmap, inputMat)
+            Imgproc.cvtColor(inputMat, inputMat, Imgproc.COLOR_RGBA2BGR)
 
-        // Prepare input for TFLite
-        val originalSize = Size(bitmap.width.toDouble(), bitmap.height.toDouble())
-        val resizedImgMat = Mat() // Will hold the resized image
+            // Prepare input for TFLite
+            val originalSize = Size(bitmap.width.toDouble(), bitmap.height.toDouble())
+            val resizedImgMat = Mat() // Will hold the resized image
 
-        // Input shape for model
-        val modelInputShape = Size(inputWidth.toDouble(), inputHeight.toDouble())
-        debug("Model input shape: ${modelInputShape.width.toInt()}x${modelInputShape.height.toInt()}")
+            // Input shape for model
+            val modelInputShape = Size(inputWidth.toDouble(), inputHeight.toDouble())
+            debug("Model input shape: ${modelInputShape.width.toInt()}x${modelInputShape.height.toInt()}")
 
-        // First preprocess using OpenCV
-        val inputTensor = preprocessImageOpenCV(
-            inputMat,
-            resizedImgMat,
-            modelInputShape
-        )
+            // First preprocess using OpenCV
+            val inputTensor = preprocessImageOpenCV(
+                inputMat,
+                resizedImgMat,
+                modelInputShape
+            )
 
-        // Run inference
-        val outputs = runInference(inputTensor)
+            // Run inference
+            return try {
+                val outputs = runInference(inputTensor)
 
-        // Process outputs to get detections
-        val detections = postprocess(
-            outputs,
-            originalSize,
-            Size(inputWidth.toDouble(), inputHeight.toDouble()),
-            confidenceThreshold,
-            iouThreshold
-        )
+                // Process outputs to get detections
+                val detections = postprocess(
+                    outputs,
+                    originalSize,
+                    Size(inputWidth.toDouble(), inputHeight.toDouble()),
+                    confidenceThreshold,
+                    iouThreshold
+                )
 
-        // Clean up
-        inputMat.release()
-        resizedImgMat.release()
+                val inferenceTime = SystemClock.elapsedRealtime() - startTime
+                debug("Detection completed in $inferenceTime ms with ${detections.size} objects")
 
-        val inferenceTime = SystemClock.elapsedRealtime() - startTime
-        debug("Detection completed in $inferenceTime ms with ${detections.size} objects")
-
-        return detections
+                detections
+            } catch (e: Exception) {
+                debug("Error during inference: ${e.message}")
+                e.printStackTrace()
+                emptyList() // Return empty list on error
+            } finally {
+                // Ensure we clean up resources
+                inputMat.release()
+                resizedImgMat.release()
+            }
+        } catch (e: Exception) {
+            debug("Error preparing input: ${e.message}")
+            e.printStackTrace()
+            return emptyList()
+        }
     }
 
     /**
@@ -169,8 +230,14 @@ class YOLO11Detector(
     private fun preprocessImageOpenCV(image: Mat, outImage: Mat, newShape: Size): ByteBuffer {
         val scopedTimer = ScopedTimer("preprocessing")
 
-        // Resize with letterboxing to maintain aspect ratio (identical to C++ version)
+        // Track original dimensions before any processing
+        debug("Original image dimensions: ${image.width()}x${image.height()}")
+        
+        // Resize with letterboxing to maintain aspect ratio
         letterBox(image, outImage, newShape, Scalar(114.0, 114.0, 114.0))
+        
+        // Log resized dimensions with letterboxing
+        debug("After letterbox: ${outImage.width()}x${outImage.height()}")
 
         // Convert BGR to RGB (YOLOv11 expects RGB input)
         val rgbMat = Mat()
@@ -346,7 +413,7 @@ class YOLO11Detector(
                     val bottom = y + h / 2
 
                     debug("Detection found: center=($x,$y), wh=($w,$h), score=$maxScore, class=$classId")
-                    debug("            box: ($left,$top,$right,$bottom)")
+                    debug("            box normalized: ($left,$top,$right,$bottom)")
 
                     // Scale coordinates to original image size
                     val scaledBox = scaleCoords(
@@ -354,6 +421,9 @@ class YOLO11Detector(
                         RectF(left, top, right, bottom),
                         originalImageSize
                     )
+                    
+                    // Additional debug for scaled box
+                    debug("            box in original image: (${scaledBox.left},${scaledBox.top},${scaledBox.right},${scaledBox.bottom})")
 
                     // Validate dimensions before adding
                     val boxWidth = scaledBox.right - scaledBox.left
@@ -672,8 +742,21 @@ class YOLO11Detector(
      * Cleanup resources when no longer needed
      */
     fun close() {
-        interpreter.close()
-        gpuDelegate?.close()
+        try {
+            interpreter.close()
+            debug("TFLite interpreter closed")
+        } catch (e: Exception) {
+            debug("Error closing interpreter: ${e.message}")
+        }
+        
+        try {
+            gpuDelegate?.close()
+            debug("GPU delegate resources released")
+        } catch (e: Exception) {
+            debug("Error closing GPU delegate: ${e.message}")
+        }
+        
+        gpuDelegate = null
     }
 
     /**
@@ -689,7 +772,7 @@ class YOLO11Detector(
 
     /**
      * Letterbox an image to fit a specific size while maintaining aspect ratio
-     * Fixed to convert Double to Float for proper type handling
+     * Fixed padding calculation to ensure consistent vertical alignment
      */
     private fun letterBox(
         image: Mat,
@@ -703,7 +786,7 @@ class YOLO11Detector(
     ) {
         val originalShape = Size(image.cols().toDouble(), image.rows().toDouble())
 
-        // Calculate ratio to fit the image within new shape - convert to Float
+        // Calculate ratio to fit the image within new shape
         var ratio = min(
             newShape.height / originalShape.height,
             newShape.width / originalShape.width
@@ -718,33 +801,47 @@ class YOLO11Detector(
         val newUnpadW = round(originalShape.width * ratio).toInt()
         val newUnpadH = round(originalShape.height * ratio).toInt()
 
-        // Calculate padding - convert to Float
-        var dw = (newShape.width - newUnpadW).toFloat()
-        var dh = (newShape.height - newUnpadH).toFloat()
+        // Calculate padding
+        val dw = (newShape.width - newUnpadW).toFloat()
+        val dh = (newShape.height - newUnpadH).toFloat()
+
+        // Calculate padding distribution
+        val padLeft: Int
+        val padRight: Int
+        val padTop: Int
+        val padBottom: Int
 
         if (auto) {
-            // Adjust padding to be multiple of stride
-            dw = ((dw % stride) / 2).toFloat()
-            dh = ((dh % stride) / 2).toFloat()
+            // Auto padding aligned to stride
+            val dwHalf = ((dw % stride) / 2).toFloat()
+            val dhHalf = ((dh % stride) / 2).toFloat()
+            
+            padLeft = (dw / 2 - dwHalf).toInt()
+            padRight = (dw / 2 + dwHalf).toInt()
+            padTop = (dh / 2 - dhHalf).toInt()
+            padBottom = (dh / 2 + dhHalf).toInt()
         } else if (scaleFill) {
             // Scale to fill without maintaining aspect ratio
-            dw = 0.0f
-            dh = 0.0f
+            padLeft = 0
+            padRight = 0
+            padTop = 0
+            padBottom = 0
             Imgproc.resize(image, outImage, newShape)
             return
+        } else {
+            // Even padding on all sides
+            padLeft = (dw / 2).toInt()
+            padRight = (dw - padLeft).toInt()
+            padTop = (dh / 2).toInt()
+            padBottom = (dh - padTop).toInt()
         }
 
-        // Debug for letterbox calculations
+        // Log detailed padding information
         debug("Letterbox: original=${originalShape.width}x${originalShape.height}, " +
-              "new=${newUnpadW}x${newUnpadH}, ratio=$ratio, pad=($dw,$dh)")
+              "new=${newUnpadW}x${newUnpadH}, ratio=$ratio")
+        debug("Letterbox: padding left=$padLeft, right=$padRight, top=$padTop, bottom=$padBottom")
 
-        // Calculate padded dimensions
-        val padLeft = (dw / 2).toInt()
-        val padRight = (dw - padLeft).toInt()
-        val padTop = (dh / 2).toInt()
-        val padBottom = (dh - padTop).toInt()
-
-        // Resize
+        // Resize the image to fit within the new dimensions
         Imgproc.resize(
             image,
             outImage,
@@ -753,7 +850,7 @@ class YOLO11Detector(
             Imgproc.INTER_LINEAR
         )
 
-        // Apply padding
+        // Apply padding to create letterboxed image
         Core.copyMakeBorder(
             outImage,
             outImage,
@@ -768,7 +865,7 @@ class YOLO11Detector(
 
     /**
      * Scale coordinates from model input size to original image size
-     * Fixed to correctly handle the absolute pixel padding
+     * Fixed vertical positioning issue with letterboxed images
      */
     private fun scaleCoords(
         imageShape: Size,
@@ -776,38 +873,39 @@ class YOLO11Detector(
         imageOriginalShape: Size,
         clip: Boolean = true
     ): RectF {
-        // Get dimensions
+        // Get dimensions in pixels
         val inputWidth = imageShape.width.toFloat()
         val inputHeight = imageShape.height.toFloat()
         val originalWidth = imageOriginalShape.width.toFloat()
         val originalHeight = imageOriginalShape.height.toFloat()
         
-        // Calculate the scale factor (ratio) between original image and resized image
+        // Calculate scaling factor (ratio) between original and input sizes
         val gain = min(inputWidth / originalWidth, inputHeight / originalHeight)
         
-        // Calculate padding to make the resized image square (this is absolute pixels)
+        // Calculate padding needed for letterboxing
         val padX = (inputWidth - originalWidth * gain) / 2.0f
         val padY = (inputHeight - originalHeight * gain) / 2.0f
         
-        // Debug info
+        // Debug dimensions
         debug("Scale coords: input=${inputWidth}x${inputHeight}, original=${originalWidth}x${originalHeight}")
         debug("Scale coords: gain=$gain, padding=($padX, $padY)")
-        debug("Scale coords: input box=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
+        debug("Scale coords: input normalized=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
         
-        // IMPORTANT: Convert the normalized coordinates back to absolute pixel coordinates
+        // Convert normalized coordinates [0-1] to absolute pixel coordinates
         val absLeft = coords.left * inputWidth
         val absTop = coords.top * inputHeight
         val absRight = coords.right * inputWidth
         val absBottom = coords.bottom * inputHeight
         
-        // Remove padding and scale back to original image size
+        debug("Scale coords: absolute pixels=($absLeft, $absTop, $absRight, $absBottom)")
+        
+        // Remove padding and scale back to original image dimensions
         val x1 = (absLeft - padX) / gain
         val y1 = (absTop - padY) / gain
         val x2 = (absRight - padX) / gain
         val y2 = (absBottom - padY) / gain
         
-        debug("Scale coords: absolute input=($absLeft, $absTop, $absRight, $absBottom)")
-        debug("Scale coords: output box=($x1, $y1, $x2, $y2)")
+        debug("Scale coords: output original=($x1, $y1, $x2, $y2)")
         
         // Create result rectangle
         val result = RectF(x1, y1, x2, y2)

@@ -12,7 +12,10 @@ import java.io.IOException
 import java.util.concurrent.Executors
 import android.os.SystemClock
 import android.graphics.Matrix
+import android.os.Build
 import androidx.core.content.ContextCompat
+import org.tensorflow.lite.gpu.CompatibilityList
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
@@ -97,15 +100,19 @@ class MainActivity : AppCompatActivity() {
             val modelPath = "best_float16.tflite"
             val labelsPath = "classes.txt"
 
+            // Check device compatibility first
+            val useGPU = checkGpuCompatibility()
+
             Log.d(TAG, "Loading model from: $modelPath")
             Log.d(TAG, "Loading labels from: $labelsPath")
+            Log.d(TAG, "Using GPU acceleration: $useGPU")
 
-            // Create detector with GPU acceleration if available
+            // Create detector with appropriate GPU settings
             yoloDetector = YOLO11Detector(
                 context = this,
                 modelPath = modelPath,
                 labelsPath = labelsPath,
-                useGPU = true
+                useGPU = useGPU
             )
 
             runOnUiThread {
@@ -214,6 +221,43 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Check if the device is compatible with GPU acceleration
+     * @return true if GPU should be used, false otherwise
+     */
+    private fun checkGpuCompatibility(): Boolean {
+        // Check if GPU delegation is supported
+        val compatList = CompatibilityList()
+        val isGpuSupported = compatList.isDelegateSupportedOnThisDevice
+
+        // Additional checks for common problematic devices or Android versions
+        val isEmulator = Build.FINGERPRINT.contains("generic") ||
+                Build.FINGERPRINT.startsWith("unknown") ||
+                Build.MODEL.contains("google_sdk") ||
+                Build.MODEL.contains("Emulator") ||
+                Build.MODEL.contains("Android SDK")
+
+        // Some devices have compatibility issues even when they report GPU support
+        val deviceModel = Build.MODEL.toLowerCase(Locale.ROOT)
+        val knownProblematicDevices = listOf("some_problematic_device_model")
+        val isProblematicDevice = knownProblematicDevices.any { deviceModel.contains(it) }
+
+        // Check OpenCL availability (indirect way)
+        val hasOpenCL = try {
+            val pm = packageManager
+            val packages = pm.getInstalledPackages(0)
+            packages.any { it.packageName.contains("opencl") || it.packageName.contains("gpu") }
+        } catch (e: Exception) {
+            false
+        }
+
+        Log.d(TAG, "GPU compatibility check: supported=$isGpuSupported, emulator=$isEmulator, " +
+                "problematic=$isProblematicDevice, OpenCL=$hasOpenCL")
+
+        // Make decision based on all factors
+        return isGpuSupported && !isEmulator && !isProblematicDevice
+    }
+
+    /**
      * Load an image from the assets folder with proper orientation and error handling
      */
     private fun loadImageFromAssets(fileName: String): Bitmap? {
@@ -221,28 +265,47 @@ class MainActivity : AppCompatActivity() {
             val startTime = SystemClock.elapsedRealtime()
 
             assets.open(fileName).use { inputStream ->
+                // Load image size first to check dimensions
                 val options = BitmapFactory.Options().apply {
-                    // Decode at full size for maximum detection quality
+                    inJustDecodeBounds = true
+                }
+                BitmapFactory.decodeStream(inputStream, null, options)
+                inputStream.reset()
+
+                // If image is very large, scale it down to avoid memory issues
+                val maxDimension = 1920 // Reasonable max size for detection
+                val sampleSize = calculateSampleSize(options.outWidth, options.outHeight, maxDimension)
+
+                // Decode with appropriate sample size
+                val decodeOptions = BitmapFactory.Options().apply {
                     inPreferredConfig = Bitmap.Config.ARGB_8888
-                    inScaled = false  // Prevent automatic scaling
+                    inScaled = false
+                    inSampleSize = sampleSize
                 }
 
-                val bitmap = BitmapFactory.decodeStream(inputStream, null, options)
+                val bitmap = BitmapFactory.decodeStream(inputStream, null, decodeOptions)
 
-                // Log the image loading time and dimensions
                 val loadTime = SystemClock.elapsedRealtime() - startTime
-                Log.d(TAG, "Image loaded: ${bitmap?.width}x${bitmap?.height}, took $loadTime ms")
-
+                Log.d(TAG, "Image loaded: ${bitmap?.width}x${bitmap?.height} " +
+                        "(original: ${options.outWidth}x${options.outHeight}, " +
+                        "sample size: $sampleSize), took $loadTime ms")
                 bitmap
             }
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to load image '$fileName' from assets", e)
-            null
-        } catch (e: OutOfMemoryError) {
-            Log.e(TAG, "Out of memory while loading image '$fileName'", e)
-            System.gc() // Request garbage collection
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load image '$fileName'", e)
             null
         }
+    }
+
+    /**
+     * Calculate appropriate sample size for large images
+     */
+    private fun calculateSampleSize(width: Int, height: Int, maxDimension: Int): Int {
+        var sampleSize = 1
+        while (width / sampleSize > maxDimension || height / sampleSize > maxDimension) {
+            sampleSize *= 2
+        }
+        return sampleSize
     }
 
     override fun onDestroy() {
