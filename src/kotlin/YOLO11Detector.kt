@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import org.opencv.android.Utils
@@ -58,105 +59,211 @@ class YOLO11Detector(
     private var numClasses: Int = 0
 
     init {
-        // Load model with proper options
-        val tfliteOptions = Interpreter.Options()
+        try {
+            // Log starting initialization for debugging purposes
+            debug("Initializing YOLO11Detector with model: $modelPath, useGPU: $useGPU")
+            debug("Device: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}")
+            
+            // Load model with proper options
+            val tfliteOptions = Interpreter.Options()
 
-        // GPU Delegate setup with improved error handling
-        if (useGPU) {
-            try {
-                val compatList = CompatibilityList()
-                if (compatList.isDelegateSupportedOnThisDevice) {
-                    debug("Attempting GPU acceleration")
+            // GPU Delegate setup with improved validation and error recovery
+            if (useGPU) {
+                try {
+                    val compatList = CompatibilityList()
+                    debug("GPU delegate supported on device: ${compatList.isDelegateSupportedOnThisDevice}")
                     
-                    // Use safer GPU delegation option that allows fallback
-                    val delegateOptions = GpuDelegate.Options().apply {
-                        setPrecisionLossAllowed(true)  // Allow precision loss for better compatibility
-                        setQuantizedModelsAllowed(true)  // Allow quantized models
-                        setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                    if (compatList.isDelegateSupportedOnThisDevice) {
+                        // First try to create GPU delegate without configuring options
+                        // This can help detect early incompatibilities
+                        try {
+                            val tempDelegate = GpuDelegate()
+                            tempDelegate.close() // Just testing creation
+                            debug("Basic GPU delegate creation successful")
+                        } catch (e: Exception) {
+                            debug("Basic GPU delegate test failed: ${e.message}")
+                            throw Exception("Device reports GPU compatible but fails basic delegate test")
+                        }
+                        
+                        debug("Configuring GPU acceleration with safe defaults")
+                        
+                        // Use conservative GPU delegation options
+                        val delegateOptions = GpuDelegate.Options().apply {
+                            setPrecisionLossAllowed(true)  // Allow precision loss for better compatibility
+                            setQuantizedModelsAllowed(true)  // Allow quantized models
+                        }
+                        
+                        gpuDelegate = GpuDelegate(delegateOptions)
+                        tfliteOptions.addDelegate(gpuDelegate)
+                        debug("GPU delegate successfully created and added")
+                        
+                        // Always configure CPU fallback options
+                        configureCpuOptions(tfliteOptions)
+                    } else {
+                        debug("GPU acceleration not supported on this device, using CPU only")
+                        configureCpuOptions(tfliteOptions)
                     }
-                    
-                    gpuDelegate = GpuDelegate(delegateOptions)
-                    tfliteOptions.addDelegate(gpuDelegate)
-                    
-                    // Set fallback options for operations not supported by GPU
-                    tfliteOptions.setUseXNNPACK(true)  // Use XNNPACK acceleration for CPU operations
-                    tfliteOptions.setAllowFp16PrecisionForFp32(true)  // Allow precision reduction
-                    
-                    debug("GPU acceleration configured with fallback options")
-                } else {
-                    debug("GPU acceleration not supported on this device, using CPU")
+                } catch (e: Exception) {
+                    debug("Error setting up GPU acceleration: ${e.message}, stack: ${e.stackTraceToString()}")
+                    debug("Falling back to CPU execution")
+                    // Clean up any GPU resources
+                    try {
+                        gpuDelegate?.close()
+                    } catch (closeEx: Exception) {
+                        debug("Error closing GPU delegate: ${closeEx.message}")
+                    }
+                    gpuDelegate = null
                     configureCpuOptions(tfliteOptions)
                 }
-            } catch (e: Exception) {
-                debug("Error setting up GPU acceleration: ${e.message}")
-                debug("Falling back to CPU execution")
-                // Clean up any GPU resources that might have been allocated
-                gpuDelegate?.close()
-                gpuDelegate = null
+            } else {
+                debug("GPU acceleration disabled, using CPU only")
                 configureCpuOptions(tfliteOptions)
             }
-        } else {
-            debug("GPU acceleration disabled by user, using CPU")
-            configureCpuOptions(tfliteOptions)
-        }
 
-        // Load the TFLite model with diagnostic information
-        val modelBuffer: MappedByteBuffer
-        try {
-            debug("Loading model from $modelPath")
-            modelBuffer = loadModelFile(modelPath)
-            debug("Model loaded successfully, size: ${modelBuffer.capacity() / 1024} KB")
+            // Enhanced model loading with diagnostics
+            val modelBuffer: MappedByteBuffer
+            try {
+                debug("Loading model from assets: $modelPath")
+                modelBuffer = loadModelFile(modelPath)
+                debug("Model loaded successfully, size: ${modelBuffer.capacity() / 1024} KB")
+
+                // Simple validation - check if buffer size is reasonable
+                if (modelBuffer.capacity() < 10000) {
+                    throw RuntimeException("Model file appears too small (${modelBuffer.capacity()} bytes)")
+                }
+            } catch (e: Exception) {
+                debug("Failed to load model: ${e.message}")
+                throw RuntimeException("Model loading failed: ${e.message}", e)
+            }
+
+            // Initialize interpreter with more controlled error handling
+            try {
+                debug("Creating TFLite interpreter")
+                
+                // Add memory management options for large models
+                tfliteOptions.setAllowFp16PrecisionForFp32(true) // Reduce memory requirements
+                
+                interpreter = Interpreter(modelBuffer, tfliteOptions)
+                debug("TFLite interpreter created successfully")
+                
+                // Log interpreter details for diagnostics
+                val inputTensor = interpreter.getInputTensor(0)
+                val inputShape = inputTensor.shape()
+                val outputTensor = interpreter.getOutputTensor(0)
+                val outputShape = outputTensor.shape()
+                
+                debug("Model input shape: ${inputShape.joinToString()}")
+                debug("Model output shape: ${outputShape.joinToString()}")
+                debug("Input tensor type: ${inputTensor.dataType()}")
+                
+                // Capture model input properties
+                inputHeight = inputShape[1]
+                inputWidth = inputShape[2]
+                isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
+                numClasses = outputShape[1] - 4
+                
+                debug("Model setup: inputSize=${inputWidth}x${inputHeight}, isQuantized=$isQuantized, numClasses=$numClasses")
+            } catch (e: Exception) {
+                debug("Failed to initialize interpreter: ${e.message}, stack: ${e.stackTraceToString()}")
+                // Clean up resources
+                try {
+                    gpuDelegate?.close()
+                } catch (closeEx: Exception) {
+                    debug("Error closing GPU delegate during cleanup: ${closeEx.message}")
+                }
+                throw RuntimeException("TFLite initialization failed: ${e.message}", e)
+            }
+
+            // Load class names
+            try {
+                classNames = loadClassNames(labelsPath)
+                debug("Loaded ${classNames.size} classes from $labelsPath")
+                classColors = generateColors(classNames.size)
+                
+                if (classNames.size != numClasses) {
+                    debug("Warning: Number of classes in label file (${classNames.size}) differs from model output ($numClasses)")
+                }
+            } catch (e: Exception) {
+                debug("Failed to load class names: ${e.message}")
+                throw RuntimeException("Failed to load class names", e)
+            }
+            
+            debug("YOLO11Detector initialization completed successfully")
         } catch (e: Exception) {
-            debug("Failed to load model: ${e.message}")
-            throw RuntimeException("Model loading failed", e)
+            debug("FATAL: Detector initialization failed: ${e.message}")
+            debug("Stack trace: ${e.stackTraceToString()}")
+            throw e  // Re-throw to ensure caller sees the failure
         }
-        
-        try {
-            interpreter = Interpreter(modelBuffer, tfliteOptions)
-            debug("TFLite interpreter created successfully")
-            
-            // Log interpreter details
-            val inputTensor = interpreter.getInputTensor(0)
-            val inputShape = inputTensor.shape()
-            val outputTensor = interpreter.getOutputTensor(0)
-            val outputShape = outputTensor.shape()
-            
-            debug("Model input shape: ${inputShape.joinToString()}")
-            debug("Model output shape: ${outputShape.joinToString()}")
-            
-            inputHeight = inputShape[1]
-            inputWidth = inputShape[2]
-            isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
-            numClasses = outputShape[1] - 4
-        } catch (e: Exception) {
-            debug("Failed to initialize interpreter: ${e.message}")
-            // Clean up resources
-            gpuDelegate?.close()
-            throw RuntimeException("TFLite initialization failed", e)
-        }
-
-        // Load class names and generate colors
-        classNames = loadClassNames(labelsPath)
-        classColors = generateColors(classNames.size)
-
-        if (classNames.size != numClasses) {
-            debug("Warning: Number of classes in label file (${classNames.size}) differs from model output ($numClasses)")
-        }
-
-        debug("Loaded ${classNames.size} classes")
     }
     
     /**
-     * Configure CPU-specific options for the TFLite interpreter
+     * Configure CPU-specific options for the TFLite interpreter with safer defaults
      */
     private fun configureCpuOptions(options: Interpreter.Options) {
-        // Determine optimal thread count based on device
-        val cpuCores = Runtime.getRuntime().availableProcessors()
-        val optimalThreads = if (cpuCores <= 4) cpuCores else cpuCores - 2
-        
-        options.setNumThreads(optimalThreads)
-        options.setUseXNNPACK(true)  // Use XNNPACK for CPU acceleration
-        debug("CPU options configured with $optimalThreads threads")
+        try {
+            // Determine optimal thread count based on device
+            val cpuCores = Runtime.getRuntime().availableProcessors()
+            // For lower-end devices, use fewer threads to avoid overwhelming the CPU
+            val optimalThreads = when {
+                cpuCores <= 2 -> 1
+                cpuCores <= 4 -> 2
+                else -> cpuCores - 2
+            }
+            
+            options.setNumThreads(optimalThreads)
+            options.setUseXNNPACK(true)  // Use XNNPACK for CPU acceleration
+            
+            // Add FlatBuffer-related options
+            options.setAllowFp16PrecisionForFp32(true)
+            options.setAllowBufferHandleOutput(true)
+            
+            debug("CPU options configured with $optimalThreads threads")
+        } catch (e: Exception) {
+            debug("Error configuring CPU options: ${e.message}")
+            // Use safe defaults
+            options.setNumThreads(1)
+        }
+    }
+
+    /**
+     * Loads the TFLite model file with enhanced error checking
+     */
+    private fun loadModelFile(modelPath: String): MappedByteBuffer {
+        try {
+            val assetManager = context.assets
+            
+            // First check if file exists
+            val assetList = assetManager.list("") ?: emptyArray()
+            debug("Available assets: ${assetList.joinToString()}")
+            
+            if (!assetList.contains(modelPath)) {
+                throw IOException("Model file not found in assets: $modelPath")
+            }
+            
+            val assetFileDescriptor = assetManager.openFd(modelPath)
+            val modelSize = assetFileDescriptor.length
+            debug("Model file size: $modelSize bytes")
+            
+            // Check if model size is reasonable
+            if (modelSize <= 0) {
+                throw IOException("Invalid model file size: $modelSize")
+            }
+            
+            val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+            val fileChannel = fileInputStream.channel
+            val startOffset = assetFileDescriptor.startOffset
+            val declaredLength = assetFileDescriptor.declaredLength
+            
+            debug("Mapping model file: offset=$startOffset, length=$declaredLength")
+            
+            return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength).also {
+                debug("Model buffer capacity: ${it.capacity()} bytes")
+            }
+        } catch (e: Exception) {
+            debug("Error loading model file: $modelPath - ${e.message}")
+            e.printStackTrace()
+            throw e
+        }
     }
 
     /**
@@ -671,18 +778,6 @@ class YOLO11Detector(
     }
 
     /**
-     * Loads the TFLite model file
-     */
-    private fun loadModelFile(modelPath: String): MappedByteBuffer {
-        val assetFileDescriptor = context.assets.openFd(modelPath)
-        val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-        val fileChannel = fileInputStream.channel
-        val startOffset = assetFileDescriptor.startOffset
-        val declaredLength = assetFileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-
-    /**
      * Loads class names from a file
      */
     private fun loadClassNames(labelsPath: String): List<String> {
@@ -1019,7 +1114,7 @@ class YOLO11Detector(
     }
 
     /**
-     * Debug print function
+     * Debug print function with enhanced logging
      */
     private fun debug(message: String) {
         Log.d(TAG, message)
