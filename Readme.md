@@ -18,7 +18,7 @@ A high-performance C++ implementation of YOLOv11 object detection using ONNX Run
 - CMake 3.12+
 - C++17 compatible compiler
 - OpenCV 4.x
-- ONNX Runtime 1.17+
+- ONNX Runtime 1.17+: https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
 - CUDA Toolkit (optional, for GPU acceleration)
 
 ## Installation

@@ -520,19 +520,19 @@ namespace utils {
             const cv::Scalar &color = classColors[detection->classId];
             cv::rectangle(image, box, color, 2, cv::LINE_AA);
 
-            std::string label = classNames[detection->classId] + ": " + std::to_string(static_cast<int>(detection->conf * 100)) + "%";
-            int baseLine = 0;
-            cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontSize, textThickness, &baseLine);
+            // std::string label = classNames[detection->classId] + ": " + std::to_string(static_cast<int>(detection->conf * 100)) + "%";
+            // int baseLine = 0;
+            // cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontSize, textThickness, &baseLine);
 
-            int labelY = std::max(detection->box.y, labelSize.height + 5);
-            cv::Point labelTopLeft(detection->box.x, labelY - labelSize.height - 5);
-            cv::Point labelBottomRight(detection->box.x + labelSize.width + 5, labelY + baseLine - 5);
+            // int labelY = std::max(detection->box.y, labelSize.height + 5);
+            // cv::Point labelTopLeft(detection->box.x, labelY - labelSize.height - 5);
+            // cv::Point labelBottomRight(detection->box.x + labelSize.width + 5, labelY + baseLine - 5);
 
             // Draw background rectangle for label
-            cv::rectangle(image, labelTopLeft, labelBottomRight, color, cv::FILLED);
+            // cv::rectangle(image, labelTopLeft, labelBottomRight, color, cv::FILLED);
 
             // Put label text
-            cv::putText(image, label, cv::Point(detection->box.x + 2, labelY - 2), cv::FONT_HERSHEY_SIMPLEX, fontSize, cv::Scalar(255, 255, 255), textThickness, cv::LINE_AA);
+            // cv::putText(image, label, cv::Point(detection->box.x + 2, labelY - 2), cv::FONT_HERSHEY_SIMPLEX, fontSize, cv::Scalar(255, 255, 255), textThickness, cv::LINE_AA);
         }
 
         DEBUG_PRINT("Bounding boxes and masks drawn on image.");
@@ -675,10 +675,49 @@ YOLO11Detector::YOLO11Detector(const std::string &modelPath, const std::string &
     inputNodeNameAllocatedStrings.push_back(std::move(input_name));
     inputNames.push_back(inputNodeNameAllocatedStrings.back().get());
 
+    // Print input tensor shape for debugging
+    std::cout << "Input tensor shape: [";
+    for (size_t i = 0; i < inputTensorShapeVec.size(); ++i) {
+        std::cout << inputTensorShapeVec[i];
+        if (i != inputTensorShapeVec.size() - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "]" << std::endl;
+
+    // Print all input names for debugging
+    std::cout << "Input names: ";
+    for (const auto& name : inputNames) {
+        std::cout << name << " ";
+    }
+    std::cout << std::endl;
+
+
     // Allocate and store output node names
     auto output_name = session.GetOutputNameAllocated(0, allocator);
     outputNodeNameAllocatedStrings.push_back(std::move(output_name));
     outputNames.push_back(outputNodeNameAllocatedStrings.back().get());
+
+    // Print all output names for debugging
+    std::cout << "Output names: ";
+    for (const auto& name : outputNames) {  
+        std::cout << name << " ";
+    }
+    std::cout << std::endl;
+
+    // Print output tensor shape for debugging
+    Ort::TypeInfo outputTypeInfo = session.GetOutputTypeInfo(0);
+    std::vector<int64_t> outputTensorShapeVec = outputTypeInfo.GetTensorTypeAndShapeInfo().GetShape();
+    std::cout << "Output tensor shape: [";
+    for (size_t i = 0; i < outputTensorShapeVec.size(); ++i) {
+        std::cout << outputTensorShapeVec[i];
+        if (i != outputTensorShapeVec.size() - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "]" << std::endl;
+
+
 
     // Set the expected input image shape based on the model's input tensor
     if (inputTensorShapeVec.size() >= 4) {
