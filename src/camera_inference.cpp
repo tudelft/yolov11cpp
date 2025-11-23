@@ -19,7 +19,7 @@ int main()
     // Configuration parameters
     const bool isGPU = false;
 
-    const std::string logsPath = "/home/mavlab/Desktop/Logs/624/camera";
+    const std::string logsPath = "../dataset/";
 
     const std::string labelsPath = "../../drone_labelling/models/classes.txt";
     // const std::string modelPath = "./best_optmized.onnx";
@@ -80,16 +80,16 @@ int main()
     // Create a vector to store the file paths and their last write times
     std::vector<std::pair<std::string, std::filesystem::file_time_type>> files;
 
-    // Iterate through the directory and collect file paths and their last write times
+    // Iterate through the directory and collect file paths
     for (const auto& entry : fs::directory_iterator(logsPath)) {
         if (entry.path().extension() == ".jpeg") {
-            files.emplace_back(entry.path().string(), fs::last_write_time(entry));
+            files.emplace_back(entry.path().string(), fs::file_time_type{});
         }
     }
 
-    // Sort the files by their last write time
+    // Sort the files by their filename
     std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
-        return a.second < b.second;
+        return a.first < b.first;
     });
 
     // Process the sorted files
@@ -119,7 +119,6 @@ int main()
 
         // Draw bounding boxes and masks on the frame
         detector.drawBoundingBoxMask(outputFrame, detections);
-
 
 
         // Write the processed frame to the output video
